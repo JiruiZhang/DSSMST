@@ -12,7 +12,7 @@ Spatial transcriptomics (ST) has redefined our exploration of tissue-level cellu
 
 DSSMST consistently achieves state-of-the-art performance across diverse datasets, including human DLPFC (10x Visium), human breast cancer, colorectal cancer, mouse forebrain, and head and neck angiosarcoma.
 
-![overview](Overview\overview.png)
+![overview](Overview/overview.png)
 
 ## Installation
 
