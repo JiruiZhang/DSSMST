@@ -58,4 +58,4 @@ R == 4.2.0
 
 A Jupyter Notebook of the tutorial is accessible from :
 
-https://github.com/JiruiZhang/MIST/blob/main/DSSMST/DLPFC.ipynb
+https://github.com/JiruiZhang/DSSMST/blob/main/DSSMST/DLPFC.ipynb
