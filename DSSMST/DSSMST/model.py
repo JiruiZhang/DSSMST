@@ -2,14 +2,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
-from mamba_ssm import Mamba
-from torch_geometric.nn import GCNConv  
 from sklearn.metrics import accuracy_score, f1_score
 import numpy as np
-from hilbertcurve.hilbertcurve import HilbertCurve
 from.preprocess import fix_seed
-from DSSM import DSSM
+from DSSMST.DSSM import DeterministicMamba
 from torch_geometric.nn import MessagePassing
+from torch_scatter import scatter_mean
+     
+# 判别器
 class Discriminator(nn.Module):
     def __init__(self, n_h):
         super(Discriminator, self).__init__()
@@ -47,17 +47,18 @@ class AvgReadout(nn.Module):
         if mask is None:
             mask = torch.eye(emb.size(0)).to(emb.device)
         vsum = torch.mm(mask, emb)
-        row_sum = torch.sum(mask, 1, keepdim=True) + 1e-8 
+        row_sum = torch.sum(mask, 1, keepdim=True) 
         global_emb = vsum / row_sum
         return F.normalize(global_emb, p=2, dim=1)   
 
-class DSSM(MessagePassing):
+
+class EnhancedMamba(MessagePassing):
     def __init__(self, in_features, mamba_dim):
         super().__init__() 
 
         self.mamba_fc = nn.Linear(in_features, mamba_dim)
         self.norm1 = nn.LayerNorm(mamba_dim, eps=1e-6) 
-        self.mamba = DSSM(dim=mamba_dim)
+        self.mamba = DeterministicMamba(dim=mamba_dim)
         self.residual_layer = nn.Linear(in_features, mamba_dim)
         self.norm2 = nn.LayerNorm(mamba_dim)
 
@@ -65,49 +66,59 @@ class DSSM(MessagePassing):
         super().reset_parameters()
         self.mamba_fc.reset_parameters()
         self.residual_layer.reset_parameters()
+        # LayerNorm 不用reset_parameters
 
-    def forward(self, x):
+    def forward(self, x, spatial_order=None, spatial_inverse_order=None):
         residual = self.residual_layer(x)
-        mamba_out = self.mamba(x.unsqueeze(0)).squeeze(0)
-        out = self.norm2(mamba_out + residual) 
+        
+        # if spatial_order is not None:
+        #     x_ordered = x[spatial_order]
+        # else:
+        #     x_ordered = x
+        x_ordered = x
+        mamba_out = self.mamba(x_ordered.unsqueeze(0)).squeeze(0)
 
+        # if spatial_inverse_order is not None:
+        #     mamba_out = mamba_out[spatial_inverse_order]
+
+        out = self.norm2(mamba_out + residual) 
         return out
 
 
-class DSSMs(nn.Module):
-    def __init__(self, in_features, out_features,dropout=0.0):
+class GAEnhancedMamba(nn.Module):
+    def __init__(self, in_features, out_features, dropout=0.0):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.mamba = DSSM(self.in_features, self.out_features)
+        self.mamba = EnhancedMamba(self.in_features, self.out_features)
         self.norm = nn.LayerNorm(self.out_features)
         self.dropout = nn.Dropout(dropout)
 
-    def reset_parameters(self):
+    def reset_parameters(self): 
         super().reset_parameters()
         self.norm.reset_parameters()
 
-
-    def forward(self, feat):
+    def forward(self, feat, spatial_order=None, spatial_inverse_order=None):
         h = feat
-        h = self.mamba(h)  
+        h = self.mamba(h, spatial_order, spatial_inverse_order)  
         h = self.norm(h)
         h = self.dropout(h)   
         return h
 
+# 编码器
 class Encoder(nn.Module):
-    def __init__(self, in_features, out_features, graph_neigh,dropout=0.0,act=F.relu):
+    def __init__(self, in_features, out_features, graph_neigh, dropout=0.0, act=F.relu):
         super(Encoder, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.dropout = dropout
         self.graph_neigh = graph_neigh
-        self.dssm = DSSMs(self.out_features, self.out_features,dropout=self.dropout)
+        self.gAEnhancedMamba = GAEnhancedMamba(self.out_features, self.out_features, dropout=self.dropout)
 
         self.act = act
 
         self.nn1 = nn.Linear(self.out_features, self.out_features)
-        self.nn2 = nn.Linear(self.in_features,self.in_features)
+        self.nn2 = nn.Linear(self.in_features, self.in_features)
         
         self.weight1 = Parameter(torch.FloatTensor(self.in_features, self.out_features))
         self.weight2 = Parameter(torch.FloatTensor(self.out_features, self.in_features)) 
@@ -120,19 +131,17 @@ class Encoder(nn.Module):
         torch.nn.init.xavier_uniform_(self.weight1)
         torch.nn.init.xavier_uniform_(self.weight2)
 
-    def forward(self, feat, feat_a, adj):
-
+    def forward(self, feat, feat_a, adj, spatial_order=None, spatial_inverse_order=None):
         z = F.dropout(feat, self.dropout, self.training)  
         z = torch.mm(z, self.weight1)
         z = torch.mm(adj, z)
         z = self.nn1(z)
     
-        z = self.dssm(z) 
+        z = self.gAEnhancedMamba(z, spatial_order, spatial_inverse_order) 
         
         h = torch.mm(z, self.weight2)
         h = self.nn2(h)
         h = torch.mm(adj, h)  
-        
         
         emb = self.act(z)
         
@@ -140,17 +149,17 @@ class Encoder(nn.Module):
         z_a = torch.mm(z_a, self.weight1)
         z_a = torch.mm(adj, z_a)
         z_a = self.nn1(z_a) 
-        z_a = self.dssm(z_a)
+        
+        z_a = self.gAEnhancedMamba(z_a, spatial_order, spatial_inverse_order)
         
         emb_a = self.act(z_a)
-
         g = self.read(emb, self.graph_neigh) 
         g = self.sigm(g)
         
         g_a = self.read(emb_a, self.graph_neigh) 
         g_a = self.sigm(g_a) 
 
+
         ret = self.disc(g, emb, emb_a) 
         ret_a = self.disc(g_a, emb_a, emb) 
-        return h, ret, ret_a
-
+        return h, emb, ret, ret_a  
